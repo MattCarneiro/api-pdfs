@@ -1,27 +1,48 @@
+// Código atualizado com Redis e Garbage Collector
+
 const express = require('express');
-const { PDFDocument } = require('pdf-lib');
 const fs = require('fs');
-const fetch = require('node-fetch');
-const sharp = require('sharp');
 const path = require('path');
 const axios = require('axios');
 const amqp = require('amqplib/callback_api');
+const progress = require('progress-stream');
 require('dotenv').config();
+
+// Importação e configuração do Redis
+const { createClient } = require('redis');
+
+// Configura o cliente Redis
+const redisClient = createClient({
+    url: process.env.REDIS_URL,
+});
+
+redisClient.on('error', (err) => {
+    console.error('Erro ao conectar ao Redis:', err);
+});
+
+redisClient.on('connect', () => {
+    console.log('Conectado ao Redis');
+});
+
+// Inicializa a conexão com o Redis
+(async () => {
+    try {
+        await redisClient.connect();
+    } catch (err) {
+        console.error('Erro ao conectar ao Redis:', err);
+    }
+})();
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Substitua pela sua chave de API do Google Drive
 const API_KEY = process.env.GOOGLE_DRIVE_API_KEY;
 const BACKOFF_RETRIES = parseInt(process.env.BACKOFF_RETRIES, 10) || 7;
-
-// Diretório para armazenar os PDFs publicamente acessíveis
 const pdfStoragePath = './public/';
 if (!fs.existsSync(pdfStoragePath)) {
     fs.mkdirSync(pdfStoragePath, { recursive: true });
 }
 
-// Configurando a pasta 'public' como estática
 app.use(express.static('public'));
 app.use(express.json());
 
@@ -36,13 +57,9 @@ let QUEUE_NAME = process.env.QUEUE_NAME;  // Nome base da fila
 const PREFETCH_COUNT = parseInt(process.env.PREFETCH_COUNT, 10); // Prefetch Count configurável
 const PROXY_TOKEN = process.env.PROXY_TOKEN;
 
-let connection;
 let channel;
-let reconnectAttempts = 0;
-const maxReconnectAttempts = 10; // Número máximo de tentativas de reconexão
-const initialReconnectDelay = 1000; // Tempo inicial de espera antes de tentar reconectar (em ms)
 
-function connectToRabbitMQ() {
+function startRabbitMQConnection(callback) {
     amqp.connect({
         protocol: 'amqp',
         hostname: RABBITMQ_HOST,
@@ -50,80 +67,35 @@ function connectToRabbitMQ() {
         username: RABBITMQ_USER,
         password: RABBITMQ_PASS,
         vhost: RABBITMQ_VHOST,
-    }, function (err, conn) {
+    }, function (err, connection) {
         if (err) {
-            console.error('[AMQP] Error connecting:', err.message);
-            return reconnect();
+            throw err;
         }
-
-        conn.on('error', function (err) {
-            if (err.message !== 'Connection closing') {
-                console.error('[AMQP] Connection error:', err.message);
+        connection.createChannel(function (err, ch) {
+            if (err) {
+                throw err;
             }
-        });
+            channel = ch;
 
-        conn.on('close', function () {
-            console.error('[AMQP] Connection closed, reconnecting...');
-            return reconnect();
-        });
+            // Capturar erros no canal
+            channel.on('error', (err) => {
+                console.error('Erro no canal:', err);
+            });
 
-        console.log('[AMQP] Connected');
-        connection = conn;
-        startConsumer();
+            // Capturar fechamento do canal
+            channel.on('close', () => {
+                console.log('Canal fechado');
+            });
+
+            callback(ch);
+        });
     });
-}
-
-function reconnect() {
-    if (reconnectAttempts < maxReconnectAttempts) {
-        reconnectAttempts++;
-        const delay = Math.min(Math.pow(2, reconnectAttempts) * initialReconnectDelay, 30000); // Backoff exponencial até 30 segundos
-        console.log(`[AMQP] Reconnecting in ${delay} ms (attempt ${reconnectAttempts}/${maxReconnectAttempts})`);
-        setTimeout(() => {
-            connectToRabbitMQ();
-        }, delay);
-    } else {
-        console.error('[AMQP] Max reconnection attempts reached');
-    }
-}
-
-function startConsumer() {
-    connection.createChannel(function (err, ch) {
-        if (closeOnErr(err)) return;
-        ch.on('error', function (err) {
-            console.error('[AMQP] Channel error:', err.message);
-        });
-        ch.on('close', function () {
-            console.log('[AMQP] Channel closed');
-            return reconnect();
-        });
-        channel = ch;
-
-        // Prepara o consumidor
-        channel.consume(QUEUE_NAME, async (msg) => {
-            try {
-                await processPdfCreation(msg);
-            } catch (error) {
-                // Em caso de erro, rejeita a mensagem sem reencaminhar
-                console.error('Erro ao processar a mensagem:', error);
-                channel.nack(msg, false, false);
-            }
-        }, { noAck: false });
-
-        console.log('[AMQP] Consumer started');
-        reconnectAttempts = 0; // Reseta o contador de tentativas de reconexão
-    });
-}
-
-function closeOnErr(err) {
-    if (!err) return false;
-    console.error('[AMQP] Error:', err);
-    connection.close();
-    return true;
 }
 
 async function fetchWithExponentialBackoff(url, options, retries = BACKOFF_RETRIES) {
+    const fetch = (await import('node-fetch')).default;
     let retryCount = 0;
-    const maxBackoff = 32000; // 32 segundos
+    const maxBackoff = 32000;
 
     while (retryCount < retries) {
         try {
@@ -134,85 +106,111 @@ async function fetchWithExponentialBackoff(url, options, retries = BACKOFF_RETRI
             return res;
         } catch (error) {
             const waitTime = Math.min(Math.pow(2, retryCount) * 1000 + Math.floor(Math.random() * 1000), maxBackoff);
-            console.log(`Retrying in ${waitTime} ms...`);
+            console.log(`Tentando novamente em ${waitTime} ms...`);
             await new Promise(resolve => setTimeout(resolve, waitTime));
             retryCount++;
         }
     }
-    throw new Error(`Failed to fetch ${url} after ${retries} retries`);
+    throw new Error(`Falha ao buscar ${url} após ${retries} tentativas`);
 }
 
-async function downloadImage(fileUrl, filePath, index, total) {
-    const res = await fetchWithExponentialBackoff(fileUrl, {}, BACKOFF_RETRIES); // Define tentativas configuráveis via env
-    const buffer = await res.buffer();
-    fs.writeFileSync(filePath, buffer);
-    console.log(`Imagem ${index + 1}/${total} baixada (${Math.round(((index + 1) / total) * 100)}%)`);
+async function downloadPdf(fileUrl, filePath, index, total) {
+    const fetch = (await import('node-fetch')).default;
+    const res = await fetchWithExponentialBackoff(fileUrl, {}, BACKOFF_RETRIES);
+
+    const totalSize = res.headers.get('content-length');
+    if (totalSize > 100 * 1024 * 1024) { // 100 MB
+        console.log(`PDF ${index + 1}/${total} ignorado por ser maior que 100 MB.`);
+        return null;
+    }
+
+    const str = progress({
+        length: totalSize,
+        time: 100 /* ms */
+    });
+
+    str.on('progress', function (progress) {
+        console.log(`Baixando PDF ${index + 1}/${total}: ${Math.round(progress.percentage)}%`);
+    });
+
+    const timestamp = new Date().toISOString().replace(/[-:.]/g, "");
+    const dest = fs.createWriteStream(filePath.replace('.pdf', `_${timestamp}.pdf`));
+    res.body.pipe(str).pipe(dest);
+
+    await new Promise((resolve, reject) => {
+        dest.on('finish', resolve);
+        dest.on('error', reject);
+    });
+
+    const finalPath = dest.path;
+    const stats = fs.statSync(finalPath);
+    console.log(`PDF ${index + 1}/${total} baixado (${Math.round(((index + 1) / total) * 100)}%)`);
+    return finalPath;
 }
 
-async function getImageUrlsFromFolder(folderId) {
-    const url = `https://www.googleapis.com/drive/v3/files?q='${folderId}'+in+parents+and+(mimeType='image/jpeg'+or+mimeType='image/png'+or+mimeType='image/webp')&key=${API_KEY}&fields=files(id,name,mimeType)`;
-    const res = await fetchWithExponentialBackoff(url, {}, BACKOFF_RETRIES); // Define tentativas configuráveis via env
+async function getPdfUrlsFromFolder(folderId) {
+    const fetch = (await import('node-fetch')).default;
+    const url = `https://www.googleapis.com/drive/v3/files?q='${folderId}'+in+parents+and+mimeType='application/pdf'&key=${API_KEY}&fields=files(id,name,mimeType,size)`;
+    const res = await fetchWithExponentialBackoff(url, {}, BACKOFF_RETRIES);
     const data = await res.json();
     if (!data.files || data.files.length === 0) {
-        throw new Error('Nenhuma imagem encontrada na pasta especificada.');
+        throw new Error('Nenhum PDF encontrado na pasta especificada.');
     }
     return data.files.map(file => ({
         url: `https://drive.google.com/uc?id=${file.id}`,
-        name: file.name
+        name: file.name,
+        size: file.size
     }));
 }
 
-async function processPdfCreation(msg, attempt = 0, log = '') {
+async function processPdfDownload(msg, attempt = 0, currentIndex = 0, log = '') {
     const { link, Id, context, UserMsg, MsgIdPhoto, MsgIdVideo, MsgIdPdf } = JSON.parse(msg.content.toString());
 
     try {
         const isFolderLink = link.includes('/folders/');
         const folderIdOrFileId = extractIdFromLink(link);
-        let images = [];
+        let pdfs = [];
 
         if (isFolderLink) {
-            images = await getImageUrlsFromFolder(folderIdOrFileId);
+            pdfs = await getPdfUrlsFromFolder(folderIdOrFileId);
         } else {
-            const imageUrl = `https://drive.google.com/uc?id=${folderIdOrFileId}`;
-            images = [{ url: imageUrl, name: 'downloaded_image' }];
+            const pdfUrl = `https://drive.google.com/uc?id=${folderIdOrFileId}`;
+            pdfs = [{ url: pdfUrl, name: 'downloaded.pdf', size: null }];
         }
 
-        if (images.length === 0) {
-            throw new Error('Nenhuma imagem encontrada na pasta ou arquivo especificado.');
+        if (pdfs.length === 0) {
+            throw new Error('Nenhum PDF encontrado na pasta ou arquivo especificado.');
         }
 
-        const imagePaths = [];
-        for (let i = 0; i < images.length; i++) {
-            const imagePath = path.join(__dirname, `${images[i].name}`);
-            await downloadImage(images[i].url, imagePath, i, images.length);
-            imagePaths.push(imagePath);
+        const pdfPaths = [];
+        for (let i = currentIndex; i < pdfs.length; i++) {
+            const pdfPath = path.join(pdfStoragePath, `${pdfs[i].name}`);
+            const finalPath = await downloadPdf(pdfs[i].url, pdfPath, i, pdfs.length);
+            if (finalPath) {
+                pdfPaths.push(finalPath);
+            } else {
+                throw new Error(`Erro ao processar o PDF ${i + 1}/${pdfs.length}`);
+            }
         }
 
-        const pdfBytes = await createPDFWithImages(imagePaths);
-        const pdfName = `pdf_${Date.now()}.pdf`;
-        fs.writeFileSync(`${pdfStoragePath}${pdfName}`, pdfBytes);
+        const pdfNames = pdfPaths.map(p => path.basename(p));
+        console.log(`PDFs baixados e processados: ${pdfNames.join(', ')}`);
 
-        // Remove as imagens temporárias
-        for (const imagePath of imagePaths) {
-            fs.unlinkSync(imagePath);
-        }
-
-        console.log(`PDF criado com sucesso: ${pdfName}`);
-
-        // Agendar para apagar o PDF após 15 minutos
+        // Agendar para apagar os PDFs após 10 minutos
         setTimeout(() => {
-            fs.unlink(`${pdfStoragePath}${pdfName}`, (err) => {
-                if (err) {
-                    console.error(`Erro ao apagar o PDF (${pdfName}):`, err);
-                } else {
-                    console.log(`PDF (${pdfName}) apagado com sucesso.`);
-                }
+            pdfPaths.forEach(pdfPath => {
+                fs.unlink(pdfPath, (err) => {
+                    if (err) {
+                        console.error(`Erro ao apagar o PDF (${pdfPath}):`, err);
+                    } else {
+                        console.log(`PDF (${pdfPath}) apagado com sucesso.`);
+                    }
+                });
             });
-        }, 900000); // 900000 milissegundos = 15 minutos
+        }, 600000); // 600000 milissegundos = 10 minutos
 
-        // Enviar webhook ao finalizar o processo
-        await axios.post('https://ultra-n8n.neuralbase.com.br/webhook/fotos-motel', {
-            pdfName,
+        await axios.post('https://ultra-n8n.neuralbase.com.br/webhook/pdfs', {
+            pdfNames,
             Id,
             context,
             UserMsg,
@@ -229,17 +227,16 @@ async function processPdfCreation(msg, attempt = 0, log = '') {
 
         channel.ack(msg);
     } catch (error) {
-        console.error('Erro ao criar o PDF:', error);
-        log += `Erro ao criar o PDF: ${error.message}\n    at ${error.stack}\n`;
+        console.error('Erro ao processar o PDF:', error);
+        log += `Erro ao processar o PDF: ${error.message}\n    at ${error.stack}\n`;
 
         if (attempt < BACKOFF_RETRIES) {
             const waitTime = Math.min(Math.pow(2, attempt) * 1000 + Math.floor(Math.random() * 1000), 32000);
-            console.log(`Retrying processPdfCreation in ${waitTime} ms... (attempt ${attempt + 1}/${BACKOFF_RETRIES})`);
-            setTimeout(() => processPdfCreation(msg, attempt + 1, log), waitTime);
+            console.log(`Tentando novamente processPdfDownload em ${waitTime} ms... (tentativa ${attempt + 1}/${BACKOFF_RETRIES})`);
+            setTimeout(() => processPdfDownload(msg, attempt + 1, currentIndex, log), waitTime);
         } else {
-            // Enviar webhook em caso de erro após todas as tentativas
-            await axios.post('https://ultra-n8n.neuralbase.com.br/webhook/fotos-motel', {
-                pdfName: null,
+            await axios.post('https://ultra-n8n.neuralbase.com.br/webhook/pdfs', {
+                pdfNames: null,
                 Id,
                 context,
                 UserMsg,
@@ -263,77 +260,58 @@ async function processPdfCreation(msg, attempt = 0, log = '') {
 function extractIdFromLink(link) {
     const fileIdMatch = link.match(/\/d\/([a-zA-Z0-9-_]+)/);
     const folderIdMatch = link.match(/\/folders\/([a-zA-Z0-9-_]+)/);
-    const idParamMatch = link.match(/id=([a-zA-Z0-9-_]+)/);
 
     if (fileIdMatch) {
         return fileIdMatch[1];
     } else if (folderIdMatch) {
         return folderIdMatch[1];
-    } else if (idParamMatch) {
-        return idParamMatch[1];
     } else {
-        return link.split('/').pop().split('?')[0];
+        return null;
     }
 }
 
-async function createPDFWithImages(imagePaths) {
-    const pdfDoc = await PDFDocument.create();
-    for (let i = 0; i < imagePaths.length; i++) {
-        const imagePath = imagePaths[i];
-
-        if (!fs.existsSync(imagePath)) {
-            throw new Error(`File not found: ${imagePath}`);
+startRabbitMQConnection((channel) => {
+    channel.consume(QUEUE_NAME, async (msg) => {
+        try {
+            await processPdfDownload(msg);
+        } catch (error) {
+            console.error('Erro ao processar a mensagem:', error);
+            channel.nack(msg, false, false); // Rejeita a mensagem sem reencaminhar
         }
+    });
+});
 
-        const imageBytes = fs.readFileSync(imagePath);
-        let img;
-        const imgType = path.extname(imagePath).toLowerCase();
-
-        if (imgType === '.webp') {
-            const pngBuffer = await sharp(imageBytes).png().toBuffer();
-            img = await pdfDoc.embedPng(pngBuffer);
-        } else if (imgType === '.jpg' || imgType === '.jpeg') {
-            img = await pdfDoc.embedJpg(imageBytes);
-        } else if (imgType === '.png') {
-            img = await pdfDoc.embedPng(imageBytes);
-        } else {
-            throw new Error(`Unsupported image type: ${imgType}`);
-        }
-
-        const { width, height } = img;
-        const page = pdfDoc.addPage([width, height]);
-        page.drawImage(img, {
-            x: 0,
-            y: 0,
-            width,
-            height
-        });
-        console.log(`Imagem ${i + 1}/${imagePaths.length} adicionada ao PDF (${Math.round(((i + 1) / imagePaths.length) * 100)}%)`);
-    }
-    return await pdfDoc.save();
-}
-
-// Inicia a conexão com o RabbitMQ
-connectToRabbitMQ();
-
-app.post('/create-pdf', (req, res) => {
+app.post('/download-pdfs', async (req, res) => {
     const { link, Id, context, UserMsg, MsgIdPhoto, MsgIdVideo, MsgIdPdf } = req.body;
 
     if (!link || !Id) {
         return res.status(400).send('Parâmetros ausentes: link e Id são necessários.');
     }
 
-    const msg = { link, Id, context, UserMsg, MsgIdPhoto, MsgIdVideo, MsgIdPdf };
-    if (channel) {
-        channel.sendToQueue(QUEUE_NAME, Buffer.from(JSON.stringify(msg)), {
-            persistent: true
-        });
+    // Implementação do controle de duplicação com Redis
+    const duplicateKey = `pdf_request:${Id}:${link}`;
+    try {
+        // Verifica se já existe um registro com o mesmo Id e link
+        const exists = await redisClient.get(duplicateKey);
 
-        console.log('Mensagem enviada para a fila');
-        res.send({ message: 'Iniciando criação do PDF.' });
-    } else {
-        console.error('Canal não estabelecido');
-        res.status(500).send('Canal RabbitMQ não está disponível.');
+        if (exists) {
+            console.log(`Solicitação ignorada para Id: ${Id}, Link: ${link} (dentro da janela de 3 minutos)`);
+            return res.send({ message: 'Solicitação ignorada (já processada nos últimos 3 minutos).' });
+        } else {
+            // Armazena no Redis com TTL de 3 minutos (180 segundos)
+            await redisClient.setEx(duplicateKey, 180, 'processed');
+
+            const msg = { link, Id, context, UserMsg, MsgIdPhoto, MsgIdVideo, MsgIdPdf };
+            channel.sendToQueue(QUEUE_NAME, Buffer.from(JSON.stringify(msg)), {
+                persistent: true
+            });
+
+            console.log('Mensagem enviada para a fila');
+            res.send({ message: 'Iniciando download dos PDFs.' });
+        }
+    } catch (error) {
+        console.error('Erro ao acessar o Redis:', error);
+        res.status(500).send('Erro interno do servidor.');
     }
 });
 
@@ -353,7 +331,6 @@ app.get('/download', (req, res) => {
     res.download(filePath, pdfName, (err) => {
         if (err) {
             console.error(`Erro ao baixar o PDF (${pdfName}):`, err);
-            res.status(500).send('Erro ao baixar o PDF.');
         }
     });
 });
@@ -361,3 +338,13 @@ app.get('/download', (req, res) => {
 app.listen(port, () => {
     console.log(`Servidor rodando em http://localhost:${port}`);
 });
+
+// Força Garbage Collection se disponível
+if (global.gc) {
+    setInterval(() => {
+        console.log('Forçando Garbage Collection...');
+        global.gc();
+    }, 60000); // Executa a cada 60 segundos
+} else {
+    console.warn('Garbage collector não disponível. Execute com --expose-gc');
+}
