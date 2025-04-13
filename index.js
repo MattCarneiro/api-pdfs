@@ -1,4 +1,4 @@
-// Código atualizado com Redis e Garbage Collector
+// Código atualizado com Redis, Garbage Collector e reconexão do RabbitMQ com intervalos de 2, 4, 8, ... segundos
 
 const express = require('express');
 const fs = require('fs');
@@ -10,8 +10,6 @@ require('dotenv').config();
 
 // Importação e configuração do Redis
 const { createClient } = require('redis');
-
-// Configura o cliente Redis
 const redisClient = createClient({
     url: process.env.REDIS_URL,
 });
@@ -37,7 +35,7 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 const API_KEY = process.env.GOOGLE_DRIVE_API_KEY;
-const BACKOFF_RETRIES = parseInt(process.env.BACKOFF_RETRIES, 10) || 7;
+const BACKOFF_RETRIES = parseInt(process.env.BACKOFF_RETRIES, 10) || 7; // Usado para operações de fetch
 const pdfStoragePath = './public/';
 if (!fs.existsSync(pdfStoragePath)) {
     fs.mkdirSync(pdfStoragePath, { recursive: true });
@@ -52,13 +50,21 @@ const RABBITMQ_PORT = process.env.RABBITMQ_PORT;
 const RABBITMQ_USER = process.env.RABBITMQ_USER;
 const RABBITMQ_PASS = process.env.RABBITMQ_PASS;
 const RABBITMQ_VHOST = process.env.RABBITMQ_VHOST;
-const QUEUE_TYPE = process.env.RABBITMQ_QUEUE_TYPE;  // Tipo da fila (lazy ou quorum)
+const QUEUE_TYPE = process.env.RABBITMQ_QUEUE_TYPE;  // lazy ou quorum
 let QUEUE_NAME = process.env.QUEUE_NAME;  // Nome base da fila
-const PREFETCH_COUNT = parseInt(process.env.PREFETCH_COUNT, 10); // Prefetch Count configurável
+const PREFETCH_COUNT = parseInt(process.env.PREFETCH_COUNT, 10);
 const PROXY_TOKEN = process.env.PROXY_TOKEN;
 
 let channel;
+let reconnectAttempts = 1; // Inicia em 1 para que o primeiro delay seja de 2 segundos
 
+// Variável global para armazenar a função callback que inicia o consumidor
+let consumerCallback = null;
+
+/**
+ * Inicia a conexão com o RabbitMQ, criando a conexão e o canal.
+ * Se ocorrer algum erro, agenda nova tentativa com backoff exponencial.
+ */
 function startRabbitMQConnection(callback) {
     amqp.connect({
         protocol: 'amqp',
@@ -69,27 +75,53 @@ function startRabbitMQConnection(callback) {
         vhost: RABBITMQ_VHOST,
     }, function (err, connection) {
         if (err) {
-            throw err;
+            console.error('[AMQP] Error connecting:', err.message);
+            return scheduleReconnect();
         }
+
+        connection.on('error', function (err) {
+            if (err.message !== 'Connection closing') {
+                console.error('[AMQP] Connection error:', err.message);
+            }
+            scheduleReconnect();
+        });
+
+        connection.on('close', function () {
+            console.error('[AMQP] Connection closed, reconnecting...');
+            scheduleReconnect();
+        });
+
         connection.createChannel(function (err, ch) {
             if (err) {
-                throw err;
+                console.error('[AMQP] Error creating channel:', err.message);
+                return scheduleReconnect();
             }
             channel = ch;
-
-            // Capturar erros no canal
-            channel.on('error', (err) => {
-                console.error('Erro no canal:', err);
+            channel.on('error', function (err) {
+                console.error('[AMQP] Channel error:', err.message);
             });
-
-            // Capturar fechamento do canal
-            channel.on('close', () => {
-                console.log('Canal fechado');
+            channel.on('close', function () {
+                console.log('[AMQP] Channel closed');
+                scheduleReconnect();
             });
-
+            reconnectAttempts = 1; // Reseta o contador ao conectar com sucesso
+            console.log('[AMQP] Conectado e canal criado');
             callback(ch);
         });
     });
+}
+
+/**
+ * Agenda uma nova tentativa de conexão com delay multiplicado:
+ * 2 s, 4 s, 8 s, 16 s, 32 s, ...
+ */
+function scheduleReconnect() {
+    const delay = Math.pow(2, reconnectAttempts) * 1000; // 2, 4, 8, ... segundos
+    console.log(`[AMQP] Reconnecting in ${delay} ms (attempt ${reconnectAttempts})`);
+    reconnectAttempts++;
+    setTimeout(() => {
+        startRabbitMQConnection(consumerCallback);
+    }, delay);
 }
 
 async function fetchWithExponentialBackoff(url, options, retries = BACKOFF_RETRIES) {
@@ -126,7 +158,7 @@ async function downloadPdf(fileUrl, filePath, index, total) {
 
     const str = progress({
         length: totalSize,
-        time: 100 /* ms */
+        time: 100 // Atualiza a cada 100 ms
     });
 
     str.on('progress', function (progress) {
@@ -207,7 +239,7 @@ async function processPdfDownload(msg, attempt = 0, currentIndex = 0, log = '') 
                     }
                 });
             });
-        }, 600000); // 600000 milissegundos = 10 minutos
+        }, 600000); // 600000 ms = 10 minutos
 
         await axios.post('https://ultra-n8n.neuralbase.com.br/webhook/pdfs', {
             pdfNames,
@@ -220,7 +252,7 @@ async function processPdfDownload(msg, attempt = 0, currentIndex = 0, log = '') 
             link,
             result: true
         }).then(() => {
-            console.log(`Webhook enviado sem erros`);
+            console.log('Webhook enviado sem erros');
         }).catch(error => {
             console.error(`Erro ao enviar webhook: ${error}`);
         });
@@ -247,7 +279,7 @@ async function processPdfDownload(msg, attempt = 0, currentIndex = 0, log = '') 
                 result: false,
                 reason: log
             }).then(() => {
-                console.log(`Webhook enviado com erros`);
+                console.log('Webhook enviado com erros');
             }).catch(error => {
                 console.error(`Erro ao enviar webhook: ${error}`);
             });
@@ -270,16 +302,20 @@ function extractIdFromLink(link) {
     }
 }
 
-startRabbitMQConnection((channel) => {
-    channel.consume(QUEUE_NAME, async (msg) => {
+// Define a função callback do consumidor para ser reutilizada em reconexões
+consumerCallback = function(ch) {
+    ch.consume(QUEUE_NAME, async (msg) => {
         try {
             await processPdfDownload(msg);
         } catch (error) {
             console.error('Erro ao processar a mensagem:', error);
-            channel.nack(msg, false, false); // Rejeita a mensagem sem reencaminhar
+            ch.nack(msg, false, false);
         }
     });
-});
+};
+
+// Inicia a conexão inicial com o RabbitMQ
+startRabbitMQConnection(consumerCallback);
 
 app.post('/download-pdfs', async (req, res) => {
     const { link, Id, context, UserMsg, MsgIdPhoto, MsgIdVideo, MsgIdPdf } = req.body;
@@ -288,17 +324,15 @@ app.post('/download-pdfs', async (req, res) => {
         return res.status(400).send('Parâmetros ausentes: link e Id são necessários.');
     }
 
-    // Implementação do controle de duplicação com Redis
+    // Controle de duplicidade com Redis (janela de 3 minutos)
     const duplicateKey = `pdf_request:${Id}:${link}`;
     try {
-        // Verifica se já existe um registro com o mesmo Id e link
         const exists = await redisClient.get(duplicateKey);
 
         if (exists) {
             console.log(`Solicitação ignorada para Id: ${Id}, Link: ${link} (dentro da janela de 3 minutos)`);
             return res.send({ message: 'Solicitação ignorada (já processada nos últimos 3 minutos).' });
         } else {
-            // Armazena no Redis com TTL de 3 minutos (180 segundos)
             await redisClient.setEx(duplicateKey, 180, 'processed');
 
             const msg = { link, Id, context, UserMsg, MsgIdPhoto, MsgIdVideo, MsgIdPdf };
@@ -339,12 +373,12 @@ app.listen(port, () => {
     console.log(`Servidor rodando em http://localhost:${port}`);
 });
 
-// Força Garbage Collection se disponível
+// Força Garbage Collection a cada 60 segundos, se disponível
 if (global.gc) {
     setInterval(() => {
         console.log('Forçando Garbage Collection...');
         global.gc();
-    }, 60000); // Executa a cada 60 segundos
+    }, 60000);
 } else {
     console.warn('Garbage collector não disponível. Execute com --expose-gc');
 }
